@@ -39,7 +39,7 @@ const formatAmount = (value: string, currency: string) =>
         maximumFractionDigits: 2,
     }).format(Number(value))}`;
 
-const formatDate = (iso: string) => {
+const formatDate = (iso: string, timeZone?: string) => {
     try {
         const d = new Date(iso);
         return d.toLocaleString(undefined, {
@@ -47,6 +47,7 @@ const formatDate = (iso: string) => {
             day: 'numeric',
             hour: '2-digit',
             minute: '2-digit',
+            timeZone,
         });
     } catch {
         return iso;
@@ -205,7 +206,7 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({
                                         <div className="flex flex-col">
                                             <span className="font-mono text-gray-600">{r.id}</span>
                                             <span className="text-gray-500">
-                                                {formatDate(r.check_in)} → {formatDate(r.check_out)}
+                                                {formatDate(r.check_in, data.timezone)} → {formatDate(r.check_out, data.timezone)}
                                             </span>
                                         </div>
                                         <span className="font-semibold text-gray-800">
