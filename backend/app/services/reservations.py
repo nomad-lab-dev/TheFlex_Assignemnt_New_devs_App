@@ -1,7 +1,7 @@
 import os
 from datetime import datetime
 from decimal import Decimal
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -21,14 +21,14 @@ async def _get_pool() -> asyncpg.Pool:
     return _DB_POOL
 
 
-async def _get_property_timezone(property_id: str, tenant_id: str) -> str:
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT timezone FROM properties WHERE id = $1 AND tenant_id = $2",
-            property_id,
-            tenant_id,
-        )
+async def _get_property_timezone(
+    conn: asyncpg.Connection, property_id: str, tenant_id: str
+) -> str:
+    row = await conn.fetchrow(
+        "SELECT timezone FROM properties WHERE id = $1 AND tenant_id = $2",
+        property_id,
+        tenant_id,
+    )
     return row["timezone"] if row and row["timezone"] else "UTC"
 
 
@@ -39,34 +39,15 @@ async def calculate_monthly_revenue(
     year: int,
 ) -> Dict[str, Any]:
     """Sum revenue for a single calendar month in the property's local timezone."""
-    tz_name = await _get_property_timezone(property_id, tenant_id)
-    tz = ZoneInfo(tz_name)
-
-    # Month boundaries expressed in the property's local tz, converted to UTC for the query.
-    start_local = datetime(year, month, 1, tzinfo=tz)
-    if month < 12:
-        end_local = datetime(year, month + 1, 1, tzinfo=tz)
-    else:
-        end_local = datetime(year + 1, 1, 1, tzinfo=tz)
-
     pool = await _get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT
-                COALESCE(SUM(total_amount), 0) AS total,
-                COUNT(*) AS count
-            FROM reservations
-            WHERE property_id = $1
-              AND tenant_id = $2
-              AND check_in_date >= $3
-              AND check_in_date <  $4
-            """,
-            property_id,
-            tenant_id,
-            start_local,
-            end_local,
-        )
+        tz_name = await _get_property_timezone(conn, property_id, tenant_id)
+        tz = ZoneInfo(tz_name)
+
+        # Month boundaries in the property's local tz; Postgres handles the UTC comparison.
+        start_local = datetime(year, month, 1, tzinfo=tz)
+        end_local = datetime(year + (month // 12), (month % 12) + 1, 1, tzinfo=tz)
+
         reservations = await conn.fetch(
             """
             SELECT id, check_in_date, check_out_date, total_amount, currency
@@ -83,7 +64,10 @@ async def calculate_monthly_revenue(
             end_local,
         )
 
-    total = Decimal(str(row["total"]))
+    total = sum(
+        (Decimal(str(r["total_amount"])) for r in reservations),
+        Decimal(0),
+    )
 
     return {
         "property_id": property_id,
@@ -93,7 +77,7 @@ async def calculate_monthly_revenue(
         "timezone": tz_name,
         "total": str(total),
         "currency": "USD",
-        "count": row["count"],
+        "count": len(reservations),
         "reservations": [
             {
                 "id": r["id"],
@@ -105,15 +89,3 @@ async def calculate_monthly_revenue(
             for r in reservations
         ],
     }
-
-
-async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
-    """Backward-compatible wrapper: defaults to March 2026 (current seed period)."""
-    default_year = int(os.getenv("REVENUE_DEFAULT_YEAR", "2026"))
-    default_month = int(os.getenv("REVENUE_DEFAULT_MONTH", "3"))
-    return await calculate_monthly_revenue(
-        property_id=property_id,
-        tenant_id=tenant_id,
-        month=default_month,
-        year=default_year,
-    )
