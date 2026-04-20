@@ -1,109 +1,95 @@
-from datetime import datetime
+import os
 from decimal import Decimal
-from typing import Dict, Any, List
+from typing import Dict, Any, Optional
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
-    """
-    Calculates revenue for a specific month.
-    """
+import asyncpg
 
-    start_date = datetime(year, month, 1)
-    if month < 12:
-        end_date = datetime(year, month + 1, 1)
-    else:
-        end_date = datetime(year + 1, 1, 1)
-        
-    print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
+# Module-level pool, lazily created on first use.
+_DB_POOL: Optional[asyncpg.Pool] = None
 
-    # SQL Simulation (This would be executed against the actual DB)
-    query = """
-        SELECT SUM(total_amount) as total
-        FROM reservations
-        WHERE property_id = $1
-        AND tenant_id = $2
-        AND check_in_date >= $3
-        AND check_in_date < $4
-    """
-    
-    # In production this query executes against a database session.
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
 
-async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
+async def _get_pool() -> asyncpg.Pool:
+    """Lazy asyncpg pool against the Postgres container from docker-compose."""
+    global _DB_POOL
+    if _DB_POOL is None:
+        # DATABASE_URL is set in docker-compose; fall back to the container alias for local dev.
+        dsn = os.getenv(
+            "DATABASE_URL",
+            "postgresql://postgres:postgres@db:5432/propertyflow",
+        )
+        _DB_POOL = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5)
+    return _DB_POOL
+
+
+async def calculate_monthly_revenue(
+    property_id: str,
+    tenant_id: str,
+    month: int,
+    year: int,
+) -> Dict[str, Any]:
     """
-    Aggregates revenue from database.
+    Sum revenue for a calendar month in the property's local timezone.
+
+    The tz math runs in Postgres via `AT TIME ZONE`: check_in_date is converted
+    from TIMESTAMPTZ to wall-clock time in the property's zone, then compared
+    against naive local month bounds. Postgres handles DST transitions for us.
     """
-    try:
-        # Import database pool
-        from app.core.database_pool import DatabasePool
-        
-        # Initialize pool if needed
-        db_pool = DatabasePool()
-        await db_pool.initialize()
-        
-        if db_pool.session_factory:
-            async with db_pool.get_session() as session:
-                # Use SQLAlchemy text for raw SQL
-                from sqlalchemy import text
-                
-                query = text("""
-                    SELECT 
-                        property_id,
-                        SUM(total_amount) as total_revenue,
-                        COUNT(*) as reservation_count
-                    FROM reservations 
-                    WHERE property_id = :property_id AND tenant_id = :tenant_id
-                    GROUP BY property_id
-                """)
-                
-                result = await session.execute(query, {
-                    "property_id": property_id, 
-                    "tenant_id": tenant_id
-                })
-                row = result.fetchone()
-                
-                if row:
-                    total_revenue = Decimal(str(row.total_revenue))
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": str(total_revenue),
-                        "currency": "USD", 
-                        "count": row.reservation_count
-                    }
-                else:
-                    # No reservations found for this property
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": "0.00",
-                        "currency": "USD",
-                        "count": 0
-                    }
-        else:
-            raise Exception("Database pool not available")
-            
-    except Exception as e:
-        print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
-        
-        # Create property-specific mock data for testing when DB is unavailable
-        # This ensures each property shows different figures
-        mock_data = {
-            'prop-001': {'total': '1000.00', 'count': 3},
-            'prop-002': {'total': '4975.50', 'count': 4}, 
-            'prop-003': {'total': '6100.50', 'count': 2},
-            'prop-004': {'total': '1776.50', 'count': 4},
-            'prop-005': {'total': '3256.00', 'count': 3}
-        }
-        
-        mock_property_data = mock_data.get(property_id, {'total': '0.00', 'count': 0})
-        
-        return {
-            "property_id": property_id,
-            "tenant_id": tenant_id, 
-            "total": mock_property_data['total'],
-            "currency": "USD",
-            "count": mock_property_data['count']
-        }
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        # Pull the property's timezone so the UI can render dates in that zone
+        # and so we can pass it to the monthly query below.
+        tz_row = await conn.fetchrow(
+            "SELECT timezone FROM properties WHERE id = $1 AND tenant_id = $2",
+            property_id,
+            tenant_id,
+        )
+        tz_name = (tz_row and tz_row["timezone"]) or "UTC"
+
+        # AT TIME ZONE $5 shifts the TIMESTAMPTZ into the property's wall-clock,
+        # which we then compare to the naive local month window.
+        reservations = await conn.fetch(
+            """
+            SELECT id, check_in_date, check_out_date, total_amount, currency
+            FROM reservations
+            WHERE property_id = $1
+              AND tenant_id = $2
+              AND (check_in_date AT TIME ZONE $5) >= make_date($3, $4, 1)
+              AND (check_in_date AT TIME ZONE $5) <  make_date($3, $4, 1) + INTERVAL '1 month'
+            ORDER BY check_in_date ASC
+            """,
+            property_id,
+            tenant_id,
+            year,
+            month,
+            tz_name,
+        )
+
+    # Keep everything in Decimal. Any cast to float here would reintroduce the
+    # sub-cent drift that NUMERIC(10, 3) is explicitly designed to avoid.
+    total = sum(
+        (Decimal(str(r["total_amount"])) for r in reservations),
+        Decimal(0),
+    )
+
+    # Dates are returned as raw UTC ISO strings; the frontend renders them in
+    # `tz_name` using Intl.DateTimeFormat({ timeZone }).
+    return {
+        "property_id": property_id,
+        "tenant_id": tenant_id,
+        "month": month,
+        "year": year,
+        "timezone": tz_name,
+        "total": str(total),
+        "currency": "USD",
+        "count": len(reservations),
+        "reservations": [
+            {
+                "id": r["id"],
+                "check_in": r["check_in_date"].isoformat(),
+                "check_out": r["check_out_date"].isoformat(),
+                "amount": str(Decimal(str(r["total_amount"]))),
+                "currency": r["currency"] or "USD",
+            }
+            for r in reservations
+        ],
+    }
